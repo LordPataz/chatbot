@@ -1,0 +1,317 @@
+# main.py
+from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from sqlalchemy import create_engine, Column, String, DateTime, Boolean, JSON
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.dialects.postgresql import UUID
+import uuid # Pro generování UUID
+from pydantic import BaseModel, EmailStr, Field
+from passlib.context import CryptContext # Pro hashování hesel
+from jose import JWTError, jwt # Pro JWT tokeny
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Any
+import logging # Pro logování
+
+# --- Konfigurace ---
+# DŮLEŽITÉ: Tyto hodnoty by měly být v konfiguračním souboru nebo proměnných prostředí v produkci.
+# Pro lokální vývoj si nastavte vlastní PostgreSQL databázi a aktualizujte DATABASE_URL.
+# Příklad DATABASE_URL: "postgresql://uzivatelske_jmeno:heslo@localhost:5432/nazev_databaze"
+DATABASE_URL = "postgresql://user:password@localhost:5432/pathfinder_ai_db" # !!! NAHRAĎTE SKUTEČNÝMI ÚDAJI !!!
+SECRET_KEY = "tento-klic-musite-zmenit-na-velmi-silny-a-nahodny"  # !!! ZMĚŇTE NA SILNÝ NÁHODNÝ KLÍČ !!!
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 # Token bude platný 60 minut
+
+# Nastavení logování
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# --- SQLAlchemy Modely (Odpovídají DB schématu) ---
+Base = declarative_base()
+
+class UserDB(Base):
+    __tablename__ = "users"
+
+    user_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    username = Column(String(100), unique=True, nullable=False, index=True)
+    email = Column(String(255), unique=True, nullable=False, index=True)
+    password_hash = Column(String(255), nullable=False)
+    full_name = Column(String(255), nullable=True)
+    profile_picture_url = Column(String, nullable=True)
+    registration_date = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    last_login_date = Column(DateTime(timezone=True), nullable=True)
+    is_verified = Column(Boolean, default=False) # Pro budoucí ověření e-mailem
+    preferences = Column(JSON, nullable=True)
+
+# --- Pydantic Modely (Pro API request/response a validaci) ---
+class UserCreate(BaseModel):
+    username: str = Field(..., min_length=3, max_length=100, description="Unikátní uživatelské jméno.")
+    email: EmailStr = Field(..., description="Platná e-mailová adresa.")
+    password: str = Field(..., min_length=8, description="Heslo, minimálně 8 znaků.")
+    full_name: Optional[str] = Field(None, max_length=255, description="Celé jméno uživatele (volitelné).")
+
+class UserDisplay(BaseModel):
+    user_id: uuid.UUID
+    username: str
+    email: EmailStr
+    full_name: Optional[str] = None
+    registration_date: datetime
+    is_verified: bool
+
+    class Config:
+        orm_mode = True
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+    expires_in: int # Přidáno pro informaci o expiraci
+
+class TokenData(BaseModel):
+    username: Optional[str] = None
+    user_id: Optional[str] = None # Přidáno pro identifikaci uživatele z tokenu
+
+# --- Bezpečnost a Utility ---
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token")
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password: str) -> str:
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.now(timezone.utc) + expires_delta
+    else:
+        expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+# --- Databázové Nastavení a Session ---
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+# Funkce pro vytvoření tabulek v databázi (pokud neexistují)
+# Měla by být volána jednou při startu aplikace (např. v main.py nebo samostatném skriptu)
+def create_db_tables():
+    try:
+        Base.metadata.create_all(bind=engine)
+        logger.info("Databázové tabulky úspěšně zkontrolovány/vytvořeny.")
+    except Exception as e:
+        logger.error(f"Chyba při vytváření databázových tabulek: {e}")
+        # V produkci by zde mohla být robustnější chybová logika
+
+# Dependency pro získání DB session
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# --- Databázové Operace (CRUD) ---
+# Tyto funkce by v reálné aplikaci byly v samostatném modulu (např. crud/user_crud.py)
+
+def get_user_by_username(db: Session, username: str) -> Optional[UserDB]:
+    return db.query(UserDB).filter(UserDB.username == username).first()
+
+def get_user_by_email(db: Session, email: str) -> Optional[UserDB]:
+    return db.query(UserDB).filter(UserDB.email == email).first()
+
+def get_user_by_id(db: Session, user_id: uuid.UUID) -> Optional[UserDB]:
+    return db.query(UserDB).filter(UserDB.user_id == user_id).first()
+
+def db_create_user(db: Session, user_data: UserCreate) -> UserDB:
+    hashed_password = get_password_hash(user_data.password)
+    db_user = UserDB(
+        username=user_data.username,
+        email=user_data.email,
+        password_hash=hashed_password,
+        full_name=user_data.full_name,
+        registration_date=datetime.now(timezone.utc)
+        # user_id se generuje automaticky (default=uuid.uuid4)
+    )
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user)
+    return db_user
+
+# --- FastAPI Aplikace a Endpoints ---
+app = FastAPI(
+    title="Pathfinder AI API",
+    description="API pro platformu Pathfinder AI - Autentizační modul",
+    version="0.1.1", # Mírně zvýšená verze
+    docs_url="/api/docs", # URL pro Swagger UI
+    redoc_url="/api/redoc" # URL pro ReDoc
+)
+
+# Zavolání funkce pro vytvoření tabulek při startu aplikace
+# V produkčním prostředí byste toto mohli chtít spravovat pomocí migračních nástrojů jako Alembic.
+@app.on_event("startup")
+async def startup_event():
+    logger.info("Aplikace se spouští...")
+    create_db_tables()
+    logger.info("Kontrola/vytváření databázových tabulek dokončeno.")
+
+
+@app.post("/auth/register", response_model=UserDisplay, status_code=status.HTTP_201_CREATED, tags=["Authentication"], summary="Registrace nového uživatele")
+async def register_user_endpoint(user_data: UserCreate, db: Session = Depends(get_db)):
+    """
+    Vytvoří nový uživatelský účet.
+
+    - **username**: Unikátní uživatelské jméno (min 3 znaky).
+    - **email**: Platná e-mailová adresa (musí být unikátní).
+    - **password**: Heslo (min 8 znaků).
+    - **full_name**: Celé jméno uživatele (volitelné).
+
+    Vrací data nově vytvořeného uživatele (bez hesla).
+    """
+    logger.info(f"Pokus o registraci uživatele: {user_data.username}, email: {user_data.email}")
+    if get_user_by_username(db, username=user_data.username):
+        logger.warning(f"Registrace selhala: Uživatelské jméno '{user_data.username}' již existuje.")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Uživatelské jméno již existuje."
+        )
+    if get_user_by_email(db, email=user_data.email):
+        logger.warning(f"Registrace selhala: Email '{user_data.email}' je již registrován.")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="E-mailová adresa je již registrována."
+        )
+    
+    try:
+        created_user = db_create_user(db=db, user_data=user_data)
+        logger.info(f"Uživatel '{created_user.username}' (ID: {created_user.user_id}) úspěšně zaregistrován.")
+        return created_user
+    except Exception as e:
+        logger.error(f"Neočekávaná chyba při registraci uživatele {user_data.username}: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Došlo k interní chybě serveru při vytváření uživatele."
+        )
+
+
+@app.post("/auth/token", response_model=Token, tags=["Authentication"], summary="Přihlášení a získání tokenu")
+async def login_for_access_token_endpoint(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    """
+    Ověří uživatele a vrátí JWT přístupový token.
+    Používá standardní `application/x-www-form-urlencoded` data:
+    - `username`: Uživatelské jméno.
+    - `password`: Heslo.
+    """
+    logger.info(f"Pokus o přihlášení uživatele: {form_data.username}")
+    user = get_user_by_username(db, username=form_data.username)
+    if not user or not verify_password(form_data.password, user.password_hash):
+        logger.warning(f"Přihlášení selhalo pro uživatele '{form_data.username}': Nesprávné přihlašovací údaje.")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Nesprávné uživatelské jméno nebo heslo.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    user.last_login_date = datetime.now(timezone.utc) # Aktualizace času posledního přihlášení
+    try:
+        db.commit()
+    except Exception as e:
+        logger.error(f"Chyba při aktualizaci last_login_date pro uživatele {user.username}: {e}", exc_info=True)
+        # Pokračujeme i v případě chyby, přihlášení je důležitější
+
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user.username, "user_id": str(user.user_id)}, 
+        expires_delta=access_token_expires
+    )
+    logger.info(f"Uživatel '{user.username}' úspěšně přihlášen. Token vygenerován.")
+    return {"access_token": access_token, "token_type": "bearer", "expires_in": int(access_token_expires.total_seconds())}
+
+async def get_current_active_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> UserDB:
+    """
+    Dekóduje token, ověří uživatele, zkontroluje jeho aktivitu a vrátí jeho data.
+    Tato funkce bude použita pro ochranu endpointů vyžadujících aktivního uživatele.
+    """
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Nelze ověřit přihlašovací údaje.",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: Optional[str] = payload.get("sub")
+        user_id_str: Optional[str] = payload.get("user_id")
+
+        if username is None or user_id_str is None:
+            logger.warning("Token neobsahuje username nebo user_id.")
+            raise credentials_exception
+        
+        try:
+            user_id = uuid.UUID(user_id_str)
+        except ValueError:
+            logger.warning(f"Neplatné UUID v tokenu: {user_id_str}")
+            raise credentials_exception
+
+        token_data = TokenData(username=username, user_id=str(user_id))
+
+    except JWTError as e:
+        logger.warning(f"Chyba při dekódování JWT: {e}")
+        raise credentials_exception
+    
+    user = get_user_by_id(db, user_id=uuid.UUID(token_data.user_id)) # Hledáme podle ID z tokenu
+    
+    if user is None:
+        logger.warning(f"Uživatel s ID '{token_data.user_id}' (username: {token_data.username}) z tokenu nebyl nalezen v DB.")
+        raise credentials_exception
+    
+    # Zde by mohla být kontrola, zda je uživatel aktivní (např. user.is_active)
+    # if not user.is_active: # Předpokládá existenci sloupce is_active v UserDB
+    #     raise HTTPException(status_code=400, detail="Neaktivní uživatel")
+    
+    return user
+
+@app.get("/users/me", response_model=UserDisplay, tags=["Users"], summary="Informace o aktuálním uživateli")
+async def read_users_me_endpoint(current_user: UserDB = Depends(get_current_active_user)):
+    """
+    Vrátí informace o aktuálně přihlášeném (autentizovaném) uživateli.
+    Tento endpoint je chráněný a vyžaduje platný Bearer token v hlavičce `Authorization`.
+    """
+    logger.info(f"Požadavek na /users/me pro uživatele: {current_user.username} (ID: {current_user.user_id})")
+    return current_user
+
+# --- Spuštění aplikace (pro lokální vývoj) ---
+# Pro spuštění použijte Uvicorn: uvicorn main:app --reload
+# Například:
+# if __name__ == "__main__":
+#     import uvicorn
+#     # Ujistěte se, že máte PostgreSQL server spuštěný a nakonfigurovaný
+#     # a že DATABASE_URL je správně nastavena.
+#     logger.info("Spouštím Uvicorn server...")
+#     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+
+# --- Důležité poznámky pro zprovoznění ---
+# 1. PostgreSQL Databáze:
+#    - Nainstalujte PostgreSQL (pokud ještě nemáte).
+#    - Vytvořte databázi (např. s názvem 'pathfinder_ai_db').
+#    - Vytvořte uživatele s právy k této databázi.
+#    - Aktualizujte `DATABASE_URL` v tomto souboru (řádek cca 15) vašimi údaji.
+#
+# 2. Python Knihovny:
+#    - Ujistěte se, že máte nainstalované všechny potřebné knihovny:
+#      pip install fastapi uvicorn sqlalchemy psycopg2-binary pydantic passlib[bcrypt] python-jose[cryptography] python-multipart
+#      (python-multipart je pro OAuth2PasswordRequestForm, i když ho přímo neimportujeme)
+#
+# 3. Spuštění Backendu:
+#    - V terminálu spusťte: uvicorn main:app --reload
+#    - Měli byste vidět logy, že se server spustil a že se pokusil vytvořit tabulky.
+#
+# 4. Tajný Klíč (SECRET_KEY):
+#    - Pro produkci MUSÍTE změnit `SECRET_KEY` na silný, náhodně generovaný řetězec.
+#      Nikdy nepoužívejte defaultní klíč v produkčním prostředí.
+#
+# 5. Migrace Databáze (Pokročilé):
+#    - Pro produkční nasazení a správu změn v databázovém schématu se doporučuje
+#      použít nástroj jako Alembic (https://alembic.sqlalchemy.org/).
+#      `Base.metadata.create_all(bind=engine)` je vhodné pro rychlý vývoj,
+#      ale méně flexibilní pro správu změn existující databáze.
